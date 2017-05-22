@@ -265,7 +265,7 @@ function differentialExpression {
     python3 gffRead.py $GFF > $OUTPUT/gffInfo.csv
 
     # Differential expression analysis
-    syscall Rscript Test_30-04-2017.r -f $OUTPUT/conditions.txt \
+    syscall Rscript DGEanalysis.r -f $OUTPUT/conditions.txt \
     -m $METHOD -o $RESULTS/DEgenes.csv -s $SPECIES -g $OUTPUT/gffInfo.csv # 2>$LOGS/Deanalysis.log 
 }
 
