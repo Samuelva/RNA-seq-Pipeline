@@ -1,26 +1,26 @@
 #!/bin/Rscript
-# Differential expression script
+# Differential gene expression analysis script.
 
 suppressMessages(library(edgeR))
 suppressMessages(library(KEGGREST))
 suppressMessages(library(pheatmap))
 
-method <- NULL
+# Global variables.
 output <- NULL
 species <- NULL
 gff <- NULL
 
-# Read the file with count files and its condition/group
-loadData <- function(countMetaFile) {
-  countMeta <- read.csv(countMetaFile, header=FALSE)
-  return(countMeta)
+# Read the file with count files and its condition/group.
+loadConditionsFile <- function(conditionsFileLoc) {
+  conditionsFile <- read.csv(conditionsFileLoc, header=FALSE)
+  return(conditionsFile)
 }
 
 
 # Loads the countdata, filters the counts and calculates the
 # normalization factor for every sample.
-getCountData <- function(countFiles, conditions) {
-  counts <- readDGE(countFiles, group=conditions)
+loadCounts <- function(countFiles, readConditions) {
+  counts <- readDGE(countFiles, group=readConditions)
   keep <- rowSums(cpm(counts)>1) >= 2
   filteredCounts <- counts[keep, , keep.lib.sizes=FALSE]
   normFactor <- calcNormFactors(filteredCounts)
@@ -28,96 +28,106 @@ getCountData <- function(countFiles, conditions) {
 }
 
 
-# classic exact test
-eTest <- function(countsData, design.matrix) {
-  dispersion <- estimateDisp(countsData)
+# Classic exact test.
+eTest <- function(counts) {
+  dispersion <- estimateDisp(counts)
   
   et <- exactTest(dispersion)
   
-  makeResults(dispersion, et)
+  generateResults(dispersion, et)
 }
 
-# generalized linear model likelihood ratiotest
-glmLRTest <- function(countsData, design.matrix) {
-  dispersion <- estimateDisp(countsData, design.matrix)
+
+# Generalized linear model likelihood ratiotest.
+glmLRTest <- function(counts, designMatrix) {
+  dispersion <- estimateDisp(counts, designMatrix)
   
-  fit <- glmFit(dispersion, design.matrix)
+  fit <- glmFit(dispersion, designMatrix)
   lrt <- glmLRT(fit)
   
-  makeResults(dispersion, lrt)
+  generateResults(dispersion, lrt)
 }
 
 
-# generalized linear model quasi likelihood f-test
-glmQLFT <- function(countsData, design.matrix) {
-  dispersion <- estimateGLMCommonDisp(countsData, design.matrix)
-  dispersion <- estimateGLMTrendedDisp(countsData, design.matrix)
+# Generalized linear model quasi likelihood f-test.
+glmQLFT <- function(counts, designMatrix) {
+  dispersion <- estimateGLMCommonDisp(counts, designMatrix)
+  dispersion <- estimateGLMTrendedDisp(counts, designMatrix)
   
-  fit <- glmQLFit(dispersion, design.matrix)
+  fit <- glmQLFit(dispersion, designMatrix)
   qlf <- glmQLFTest(fit)
   
-  makeResults(dispersion, qlf)
+  generateResults(dispersion, qlf)
 }
 
 
 # Processes the results, formats it and writes it away.
-makeResults <- function(dispersion, DGE) {
+generateResults <- function(dispersion, DGETestResults) {
   # If a KEGG species identifier is supplied, pathway analysis will be performed,
   # if not, it is skipped.
   if (!is.null(species)) {
     # Object containing the NCBI protein ID's and the corresponding KEGG protein id.
     keggIDs <- keggConv(species, "ncbi-proteinid")
-    pathwayAnnotation(DGE, keggIDs)
+    pathwayEnrichmentAnalysis(DGETestResults, keggIDs)
   }
   
-  gffInfo <- loadCSV()
-  
+  # Variable containing the contents of the gff file.
+  gffInfo <- loadGFF()
   countsPM <- cpm(dispersion)
-  fdr <- p.adjust(DGE$table$PValue, method="BH")
-  results <- cbind(countsPM, DGE$table, fdr)
+  fdr <- p.adjust(DGETestResults$table$PValue, method="BH")
+  
+  # Results is a dataframe containing information such as counts, countspm,
+  # p-value, fdr, and annotations for every gene.
+  results <- cbind(countsPM, DGETestResults$table, fdr)
   results$Accession <- rownames(results)
   results <- merge(results, gffInfo, by.x="Accession", by.y="GffAccession")
   results <- geneAnnotation(results)
-  makeGraphs(cpm(dispersion, log=TRUE), DGE, results)
+  
+  generateGraphs(cpm(dispersion, log=TRUE), DGETestResults, results)
   
   exportData(results, "Genes.csv")
 }
 
 
-loadCSV <- function() {
+# Opens a gff file and returns its content.
+loadGFF <- function() {
   gffInfo <- read.csv2(gff, sep="\t")
   return(gffInfo)
 }
 
 
-# Makes grapgs
-makeGraphs <- function(cpm, DGE, results) {
-  topDEG <- rownames(topTags(DGE, n=30))
-  GeneNames <- unname(sapply(topDEG, function(x)
+# Generates graphs.
+generateGraphs <- function(cpm, DGETestResults, results) {
+  # determines the top differentially expressed genes with the built-in function topTags
+  topDEGAccession <- rownames(topTags(DGETestResults, n=30))
+  # Converts NCBI accession numbers to gene names which will be displayed in the
+  # heatmap.
+  topDEGNames <- unname(sapply(topDEGAccession, function(x)
   {gsub("_", ".", results$NCBIGeneName[results$Accession==x])}))
-  png(paste(output, "Heatmap.png"))
-  # Log cpm is manually calculated so it becomes available for every sample
-  # instead of just the conditions (which is the case if we used 
-  # DGE$table$logcpm)
+  
+  # Heatmap generation.
+  png(paste(output, "Heatmap.png", sep=""))
   par(mar=c(4,4.5,2,2))
   par(oma=c(0,0,0,0))
-  colLabels <- as.character(DGE$samples$group)
-  pheatmap(cpm[topDEG,], labels_col=colLabels, labels_row=GeneNames) # log 2 value
+  colLabels <- as.character(DGETestResults$samples$group)
+  pheatmap(cpm[topDEGAccession,], labels_col=colLabels, labels_row=topDEGNames) # log 2 value
   dev.off()
   
-  DGE$colour[p.adjust(DGE$table$PValue, "BH")<=0.05] <- "red"
-  DGE$colour[p.adjust(DGE$table$PValue, "BH")>0.05] <- "black"
-  png(paste(output, "Volcano-plot.png"))
-  # Log 10 value of pvalue is used (for now)
-  plot(DGE$table$logFC, -log(p.adjust(DGE$table$PValue, "BH")), xlab="log2 fold change", 
-       ylab="-log2 FDR", main="Volcano plot", col=DGE$colour, cex=0.2)
+  # Volcano plot generation.
+  DGETestResults$colour[p.adjust(DGETestResults$table$PValue, "BH")<=0.05] <- "red"
+  DGETestResults$colour[p.adjust(DGETestResults$table$PValue, "BH")>0.05] <- "black"
+  
+  png(paste(output, "Volcano-plot.png", sep=""))
+  plot(DGETestResults$table$logFC, -log(p.adjust(DGETestResults$table$PValue, "BH")), xlab="log2 fold change", 
+       ylab="-log2 FDR", main="Volcano plot", col=DGETestResults$colour, cex=0.2)
   dev.off()
   
-  de <- decideTestsDGE(DGE, adjust.method="fdr")
-  detags <- rownames(DGE)[as.logical(de)]
-  png(paste(output, "MA-plot.png"))
+  # MA-plot generation.
+  de <- decideTestsDGE(DGETestResults, adjust.method="fdr")
+  detags <- rownames(DGETestResults)[as.logical(de)]
+  png(paste(output, "MA-plot.png", sep=""))
   # Plots log FC (log 10) against average log cpm (log 2)
-  plotSmear(DGE, de.tags=detags)
+  plotSmear(DGETestResults, de.tags=detags)
   dev.off()
 }
 
@@ -131,27 +141,26 @@ geneAnnotation <- function(results) {
   # in the supplied data frame are NCBI protein ID's, these are supplied to a function
   # which returns the corresponding KEGG protein ID.
   results$keggProteinID <- sapply(results$Accession, function(x) {
-    paste("smu:", unlist(ncbiToKegg(strsplit(x, ".", fixed=TRUE)[[1]][1], keggIDs)), sep="")
+    paste(paste(species, ":", sep=""), unlist(ncbiToKegg(strsplit(x, ".", fixed=TRUE)[[1]][1], keggIDs)), sep="")
   })
   
   keggProteins <- keggList(species)
   genePathwayIDs <- keggLink("pathway", species)
   speciesPathwayNames <- keggList(unique(unname(genePathwayIDs)))
   
-  results$proteinFunction <- noName(results$keggProteinID, keggProteins)
-  results$pathwayID <- noName(results$keggProteinID, genePathwayIDs)
-  results$pathwayFunction <- noName(results$pathwayID, speciesPathwayNames)
+  results$proteinFunction <- convert(results$keggProteinID, keggProteins)
+  results$pathwayID <- convert(results$keggProteinID, genePathwayIDs)
+  results$pathwayFunction <- convert(results$pathwayID, speciesPathwayNames)
   return(results)
 }
 
 
 # Function for converting NCBI protein ID's to KEGG protein ID's.
 # Accepts a NCBI protein ID and a conversion object, containing NCBI protein ID's and their
-# corresponding KEGG ID's
+# corresponding KEGG ID's.
 ncbiToKegg <- function(id, keggIDs) {
   proteinPrefix <- c("AP_", "NP_", "YP_", "XP_", "ZP_")
   
-  # lapply(df, function(x) {
   if ("TRUE" %in% sapply(proteinPrefix, grepl, id)) {
     return(unlist(strsplit(keggIDs[paste("ncbi-proteinid:", id, sep="")][[1]], ":", fixed=TRUE))[2])
   } else {
@@ -159,13 +168,14 @@ ncbiToKegg <- function(id, keggIDs) {
   }
 }
 
-# Used for conversion
+
+# Used for conversion.
 # A source data frame column and target object is supplied.
 # The target contains something like a list with ID's and corresponding data,
-# pathway ID's and their function for example. A data frame column containing
-# these ID's, for example, is supplied, which will be used to search the corresponding value
-# to return and add to the original data frame.
-noName <- function(df, target) {
+# e.g. pathway ID's and their function. A data frame column containing
+# these pathway ID's, is supplied, which will be used to get the corresponding value
+# (pathway function) which is returned and added to the original data frame.
+convert <- function(df, target) {
   sapply(df, function(x) {
     if (!is.na(x)) {
       return(unname(target[x]))
@@ -176,8 +186,8 @@ noName <- function(df, target) {
 }
 
 
-# Pathway annotation.
-pathwayAnnotation <- function(resultsDf, keggIDs) {
+# Pathway enrichment analysis. Performed using the built in function kegga.
+pathwayEnrichmentAnalysis <- function(resultsDf, keggIDs) {
   row.names(resultsDf) <- lapply(rownames(resultsDf), function(x) {
     unlist(ncbiToKegg(strsplit(x, ".", fixed=TRUE)[[1]][1], keggIDs))
   })
@@ -199,9 +209,10 @@ main <- function(args) {
     cat("Too few arguments given, aborting...\n")
     quit()
   }
+  
   for (i in 1:length(args)) {
     if (args[i] %in% c("-f", "--file")) {
-      countMetaFile <- args[i+1]
+      conditionsFileLoc <- args[i+1]
     } else if (args[i] %in% c("-m", "--method")) {
       method <- tolower(args[i+1])
     } else if (args[i] %in% c("-o", "--output")) {
@@ -212,22 +223,23 @@ main <- function(args) {
       gff <<- args[i+1]
     }
   }
-  countMetaData <- loadData(countMetaFile)
-  conditions <- as.vector(countMetaData$V1)
-  countFiles <- as.vector(countMetaData$V2)
   
-  countsData <- getCountData(countFiles, conditions)
-  design.matrix <- model.matrix(~factor(conditions))
+  conditionsFile <- loadConditionsFile(conditionsFileLoc)
+  readConditions <- as.vector(conditionsFile$V1)
+  countFiles <- as.vector(conditionsFile$V2)
   
-  # Make if statement for different DGE methods
+  counts <- loadCounts(countFiles, readConditions)
+  designMatrix <- model.matrix(~factor(readConditions))
+  
+  # Make if statement for different DGE methods.
   if (method == "et" || method == "exacttest") {
-    eTest(countsData, design.matrix)
+    eTest(counts)
   } else if (method == "glmqlf" || method == "glmqlftest") {
-    glmQLFT(countsData, design.matrix)
+    glmQLFT(counts, designMatrix)
   } else if (method == "glmlrt" || method == "qlmlrttest") {
-    glmLRTest(countsData, design.matrix)
+    glmLRTest(counts, designMatrix)
   }
 }
 
-main(commandArgs(T))
 
+main(commandArgs(T))

@@ -38,8 +38,8 @@ fi
 # Can currently be easily fooled if a given file or directory contains something
 # like -f, -r, -g or -c.
 # -------------------------------------------------------------------
-if [[ ! $@ == *"-f"* || ! $@ == *"-r"* || ! $@ == *"-g"* || ! $@ == *"-c"* || ! $@ == *"-s"* || ! $@ == *"-m"* ]]; then
-    echo "Parameters -f, -r, -g, -c, -s, or -m missing..."
+if [[ ! $@ == *"-f"* || ! $@ == *"-r"* || ! $@ == *"-g"* || ! $@ == *"-c"* || ! $@ == *"-m"* ]]; then
+    echo "Parameters -f, -r, -g, -c, or -m missing..."
     echo "Please see the userguide."
     exit 1
 fi
@@ -103,8 +103,9 @@ while [[ $# -gt 0 ]]; do
         -o|--output) OUTPUT="$2"; shift;;
         -e|--extension) EXTENSION="$2"; shift;;
         -t|--threads) THREADS="$2"; shift;;
-        -h|--h|-help|--help) help; shift;;
+        -h|--help) help; shift;;
         # Trimmomatic settings
+        -ti|--illuminaclip) ILLUMINACLIP="$2"; shift;;
         -tl|--leading) LEADING="$2"; shift;;
         -tt|--trailing) TRAILING="$2"; shift;;
         -ts|--slidingwindow) SLIDINGWINDOW="$2"; shift;;
@@ -148,7 +149,6 @@ TRIMMEDREADS=$OUTPUT/TrimmedReads
 BOWTIEINDEX=$OUTPUT/BowtieIndex
 BOWTIEOUTPUT=$OUTPUT/BowtieOutput
 COUNTS=$OUTPUT/Counts
-LOGS=$OUTPUT/Logs
 RESULTS=$OUTPUT/Results
 
 function makeDirs {
@@ -168,7 +168,7 @@ function makeDirs {
     mkdir $BOWTIEOUTPUT
     mkdir $COUNTS
     mkdir $RESULTS
-    mkdir $LOGS
+    mkdir $RESULTS/FastQC
 }
 
 function syscall {
@@ -181,7 +181,7 @@ function syscall {
         echo "Error with $@" >&2
         echo "Status: $status" >&2
         echo "The pipeline has come to an unexpected end with exit status $status"
-        echo "Please check $LOGS for more details..."
+        echo "Please check the callback..."
         exit $status
     fi
     return $status
@@ -195,12 +195,15 @@ function trimming {
         TRIMOUT=${read##*/}
         echo "Trimming reads from $read..."
 
-        ./FastQC/fastqc
+        ./FastQC/fastqc $read -outdir $RESULTS/FastQC
 
         syscall java -jar trimmomatic-0.36.jar SE $read \
         $TRIMMEDREADS/trimmed_$TRIMOUT ILLUMINACLIP:adapters/$ILLUMINACLIP \
         LEADING:$LEADING TRAILING:$TRAILING SLIDINGWINDOW:$SLIDINGWINDOW \
-        MINLEN:$MINLEN -threads $THREADS 2>$LOGS/TrimLog_$(basename $TRIMOUT .$EXTENSION).log
+        MINLEN:$MINLEN -threads $THREADS
+
+        ./FastQC/fastqc $TRIMMEDREADS/trimmed_$TRIMOUT -outdir $RESULTS/FastQC
+
     done
 }
 
@@ -211,19 +214,17 @@ function mapping {
     echo "Indexing reference genome..."
 
     # Bowtie2 indexing
-    syscall bowtie2-build $REFERENCE $BOWTIEINDEX/index \
-    2>$LOGS/BowtieIndexLog.log
+    syscall bowtie2-build $REFERENCE $BOWTIEINDEX/index
 
     # Bowtie2 mapping
     # Loop loops over every file in the directory with the trimmed reads
     # and maps it against the reference genome. 
     for tReads in $TRIMMEDREADS/trimmed_*; do
         BASENAME=$(basename $tReads .$EXTENSION) # Strips path and extension from file
-        # BOWTIEOUT=${TREADSBASENAME%.*} # Strips the
         echo "Mapping reads from $tReads..."
 
         syscall bowtie2 -p $THREADS -x $BOWTIEINDEX/index -q \
-        $tReads -S $BOWTIEOUTPUT/$BASENAME.sam 2>$LOGS/MapLog_$BASENAME.log
+        $tReads -S $BOWTIEOUTPUT/$BASENAME.sam
     done
 }
 
@@ -238,9 +239,22 @@ function quantification {
     for alFile in $BOWTIEOUTPUT/*; do
         BASENAME=$(basename $alFile .sam) # Strip path and extension from file
         syscall htseq-count -t CDS -s no -i Name $alFile $GFF | grep -v ^__\
-        > $COUNTS/$BASENAME.txt 2>$LOGS/CountLog_$BASENAME.log &
+        > $COUNTS/$BASENAME.txt &
     done
     wait
+}
+
+function differentialExpression {
+    echo "Differentializing..."
+
+    for line in $(cat $CONDITIONS); do
+        CONDITION=${line%,*}
+        SAMPLES1=${line#*,}
+        SAMPLES2=${SAMPLES1%.*}
+        SAMPLESBASENAME=$(basename $SAMPLES2)
+
+        echo $CONDITION,$(realpath $OUTPUT/Counts/trimmed_$SAMPLESBASENAME.txt)
+    done
 }
 
 function differentialExpression {
@@ -255,25 +269,31 @@ function differentialExpression {
     # corresponding reads.
     for line in $(cat $CONDITIONS); do
         # Condition, to which the reads belong to:
-        CONDITION=${line%,*} # 
-        BASENAME=$(basename $line .$EXTENSION) # Remove path and extension from files
+        CONDITION=${line%,*}
 
-        # Puts the conditions and their corresponding counts in a new file.
-        echo $CONDITION,$(realpath $OUTPUT/Counts/trimmed_$BASENAME.txt) \
+        # Remove path and extension from the sample files, so the basename can be used
+        # to specify the location of the count tables.
+        SAMPLES1=${line#*,}
+        SAMPLES2=${SAMPLES1%.*}
+        SAMPLESBASENAME=$(basename $SAMPLES2) # Remove path and extension from files
+
+        # Combines the conditions, and sample basenames with the location and extension of the
+        # count tables. Outputted file will be used by differential gene expression analysis script to link
+        # the conditions to the count tables.
+        echo $CONDITION,$(realpath $OUTPUT/Counts/trimmed_$SAMPLESBASENAME.txt) \
         >> $OUTPUT/conditions.txt
     done
-    python3 gffRead.py $GFF > $OUTPUT/gffInfo.csv
 
+    python3 gffRead.py $GFF > $OUTPUT/gffInfo.csv
     # Differential expression analysis
     syscall Rscript DGEanalysis.r -f $OUTPUT/conditions.txt \
-    -m $METHOD -o $RESULTS/DEgenes.csv -s $SPECIES -g $OUTPUT/gffInfo.csv # 2>$LOGS/Deanalysis.log 
+    -m $METHOD -o $RESULTS/ -s $SPECIES -g $OUTPUT/gffInfo.csv
 }
 
-# makeDirs
-# trimming
-# mapping
-# quantification
+makeDirs
+trimming
+mapping
+quantification
 differentialExpression
 
 echo "Done"
-
